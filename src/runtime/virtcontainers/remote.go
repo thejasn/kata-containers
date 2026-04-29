@@ -36,8 +36,17 @@ type remoteService struct {
 }
 
 func openRemoteService(socketPath string) (*remoteService, error) {
+	var conn net.Conn
+	var err error
 
-	conn, err := net.Dial("unix", socketPath)
+	for attempt := 0; attempt < 5; attempt++ {
+		conn, err = net.Dial("unix", socketPath)
+		if err == nil {
+			break
+		}
+		hvLogger.WithField("attempt", attempt+1).WithError(err).Warn("failed to connect to remote hypervisor, retrying...")
+		time.Sleep(time.Duration(1<<attempt) * time.Second)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to remote hypervisor socket: %w", err)
 	}
@@ -59,12 +68,22 @@ func (s *remoteService) Close() error {
 }
 
 func (rh *remoteHypervisor) CreateVM(ctx context.Context, id string, network Network, hypervisorConfig *HypervisorConfig) error {
-
-	rh.sandboxID = remoteHypervisorSandboxID(id)
-
 	if err := rh.setConfig(hypervisorConfig); err != nil {
 		return err
 	}
+
+	// Check if we're reconnecting to an existing sandbox (state was restored via Load())
+	if rh.agentSocketPath != "" && string(rh.sandboxID) != "" {
+		if string(rh.sandboxID) != id {
+			hvLogger.Warnf("remoteHypervisor: sandbox ID mismatch, expected %s but restored %s", id, rh.sandboxID)
+		}
+		hvLogger.Infof("remoteHypervisor: reconnecting to existing sandbox %s", rh.sandboxID)
+
+		return nil
+	}
+
+	// New sandbox creation
+	rh.sandboxID = remoteHypervisorSandboxID(id)
 
 	s, err := openRemoteService(hypervisorConfig.RemoteHypervisorSocket)
 	if err != nil {
@@ -285,12 +304,18 @@ func (rh *remoteHypervisor) Check() error {
 	return nil
 }
 
-func (rh *remoteHypervisor) Save() persistapi.HypervisorState {
-	return persistapi.HypervisorState{}
+func (rh *remoteHypervisor) Save() (s persistapi.HypervisorState) {
+	s.AgentSocketPath = rh.agentSocketPath
+	s.RemoteSandboxID = string(rh.sandboxID)
+
+	return
 }
 
-func (rh *remoteHypervisor) Load(persistapi.HypervisorState) {
-	notImplemented("Load")
+func (rh *remoteHypervisor) Load(s persistapi.HypervisorState) {
+	rh.agentSocketPath = s.AgentSocketPath
+	rh.sandboxID = remoteHypervisorSandboxID(s.RemoteSandboxID)
+	hvLogger.Infof("remoteHypervisor: restored agentSocketPath from state (set=%v)", s.AgentSocketPath)
+	hvLogger.Infof("remoteHypervisor: restored sandbox ID from state (set=%v)", s.RemoteSandboxID)
 }
 
 func (rh *remoteHypervisor) IsRateLimiterBuiltin() bool {
