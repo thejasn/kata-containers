@@ -1624,10 +1624,11 @@ impl agent_ttrpc::AgentService for AgentService {
         req: protocols::agent::GetOOMEventRequest,
     ) -> ttrpc::Result<OOMEvent> {
         is_allowed(&req).await?;
-        let s = self.sandbox.lock().await;
-        let event_rx = &s.event_rx.clone();
+        let event_rx = {
+            let s = self.sandbox.lock().await;
+            s.event_rx.clone()
+        };
         let mut event_rx = event_rx.lock().await;
-        drop(s);
 
         let container_id = event_rx
             .recv()
