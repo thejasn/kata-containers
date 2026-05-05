@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"os"
 	"path"
 	"path/filepath"
@@ -179,7 +180,10 @@ const (
 
 // newKataAgent returns an agent from an agent type.
 func newKataAgent() agent {
-	return &kataAgent{}
+	return &kataAgent{
+		reconnectAttempts: 30,
+		reconnectDelay:    2 * time.Second,
+	}
 }
 
 // The function is declared this way for mocking in unit tests
@@ -208,6 +212,30 @@ func getFSGroupChangePolicy(policy volume.FSGroupChangePolicy) pbTypes.FSGroupCh
 	default:
 		return pbTypes.FSGroupChangePolicy_Always
 	}
+}
+
+func isConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+
+	connectionErrors := []string{
+		"ttrpc: closed",
+		"connection refused",
+		"connection reset",
+		"broken pipe",
+		"EOF",
+		"use of closed network connection",
+	}
+	for _, ce := range connectionErrors {
+		if strings.Contains(errStr, ce) {
+			return true
+		}
+	}
+
+	code := grpcStatus.Code(err)
+	return code == codes.Unavailable || code == codes.Aborted
 }
 
 // Shared path handling:
@@ -330,6 +358,10 @@ type kataAgent struct {
 
 	keepConn bool
 	dead     bool
+
+	reconnectAttempts uint
+	reconnectDelay    time.Duration
+	reconnecting      bool
 }
 
 func (k *kataAgent) Logger() *logrus.Entry {
@@ -2168,7 +2200,23 @@ func (k *kataAgent) statsContainer(ctx context.Context, sandbox *Sandbox, c Cont
 
 func (k *kataAgent) connect(ctx context.Context) error {
 	if k.dead {
-		return errors.New("Dead agent")
+		if k.state.URL == "" {
+			return errors.New("dead agent with no URL to reconnect")
+		}
+		socketPath := strings.TrimPrefix(k.state.URL, "unix://")
+		socketPath = strings.TrimPrefix(socketPath, "remote://")
+
+		if _, err := os.Stat(socketPath); err != nil {
+			return errors.New("dead agent, socket not available")
+		}
+		conn, err := net.DialTimeout("unix", socketPath, 2*time.Second)
+		if err != nil {
+			return fmt.Errorf("dead agent, socket not connectable: %w", err)
+		}
+		conn.Close()
+
+		k.Logger().Warn("agent was dead but socket is now connectable, attempting reconnection")
+		k.dead = false
 	}
 	// lockless quick pass
 	if k.client != nil {
@@ -2186,7 +2234,26 @@ func (k *kataAgent) connect(ctx context.Context) error {
 	}
 
 	k.Logger().WithField("url", k.state.URL).Info("New client")
-	client, err := kataclient.NewAgentClient(k.ctx, k.state.URL, k.dialTimout)
+
+	var client *kataclient.AgentClient
+	err := retry.Do(
+		func() error {
+			var err error
+			client, err = kataclient.NewAgentClient(k.ctx, k.state.URL, k.dialTimout)
+			return err
+		},
+		retry.Attempts(k.reconnectAttempts),
+		retry.Delay(k.reconnectDelay),
+		retry.MaxDelay(10*time.Second),
+		retry.DelayType(retry.BackOffDelay),
+		retry.OnRetry(func(n uint, err error) {
+			k.Logger().WithField("attempt", n+1).WithError(err).Warn("agent connection failed, retrying...")
+		}),
+		retry.RetryIf(func(err error) bool {
+			return isConnectionError(err)
+		}),
+		retry.LastErrorOnly(true),
+	)
 	if err != nil {
 		k.dead = true
 		return err
@@ -2437,6 +2504,10 @@ func (k *kataAgent) getReqContext(ctx context.Context, reqName string) (newCtx c
 }
 
 func (k *kataAgent) sendReq(spanCtx context.Context, request interface{}) (interface{}, error) {
+	return k.sendReqWithRetry(spanCtx, request, true)
+}
+
+func (k *kataAgent) sendReqWithRetry(spanCtx context.Context, request interface{}, allowReconnect bool) (interface{}, error) {
 	start := time.Now()
 
 	if err := k.connect(spanCtx); err != nil {
@@ -2478,7 +2549,43 @@ func (k *kataAgent) sendReq(spanCtx context.Context, request interface{}) (inter
 	defer func() {
 		agentRPCDurationsHistogram.WithLabelValues(msgName).Observe(float64(time.Since(start).Nanoseconds() / int64(time.Millisecond)))
 	}()
-	return handler(ctx, request)
+
+	resp, err := handler(ctx, request)
+
+	if err != nil && allowReconnect && isConnectionError(err) {
+		k.Logger().WithError(err).Warn("Connection error detected, attempting reconnection")
+
+		k.Lock()
+		k.reconnecting = true
+		if k.client != nil {
+			k.client.Close()
+			k.client = nil
+		}
+		k.reqHandlers = nil
+		k.dead = true
+		k.Unlock()
+
+		// Retry once after reconnection (allowReconnect=false prevents recursion)
+		resp, err = k.sendReqWithRetry(spanCtx, request, false)
+
+		k.Lock()
+		k.reconnecting = false
+		k.Unlock()
+
+		if err == nil {
+			k.Logger().Info("reconnection successful, request completed")
+		} else {
+			k.Logger().WithError(err).Warn("Operation failed after reconnection")
+		}
+		return resp, err
+	}
+
+	if err != nil && strings.Contains(err.Error(), "already exists") {
+		k.Logger().WithError(err).Warn("Operation already completed, treating as success")
+		return resp, nil
+	}
+
+	return resp, err
 }
 
 // readStdout and readStderr are special that we cannot differentiate them with the request types...

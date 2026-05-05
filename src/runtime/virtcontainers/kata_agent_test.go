@@ -8,8 +8,10 @@ package virtcontainers
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path"
 	"path/filepath"
@@ -17,9 +19,12 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/stretchr/testify/assert"
+	"google.golang.org/grpc/codes"
+	grpcStatus "google.golang.org/grpc/status"
 
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/api"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
@@ -1365,4 +1370,204 @@ func TestKataAgentCreateContainerVFIODevices(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestIsConnectionError(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		expected bool
+	}{
+		{
+			name:     "nil error",
+			err:      nil,
+			expected: false,
+		},
+		{
+			name:     "ttrpc closed",
+			err:      errors.New("ttrpc: closed"),
+			expected: true,
+		},
+		{
+			name:     "connection refused",
+			err:      errors.New("dial unix /path/to/socket: connection refused"),
+			expected: true,
+		},
+		{
+			name:     "connection reset",
+			err:      errors.New("read: connection reset by peer"),
+			expected: true,
+		},
+		{
+			name:     "broken pipe",
+			err:      errors.New("write: broken pipe"),
+			expected: true,
+		},
+		{
+			name:     "EOF",
+			err:      errors.New("unexpected EOF"),
+			expected: true,
+		},
+		{
+			name:     "closed network connection",
+			err:      errors.New("use of closed network connection"),
+			expected: true,
+		},
+		{
+			name:     "grpc unavailable",
+			err:      grpcStatus.Error(codes.Unavailable, "service unavailable"),
+			expected: true,
+		},
+		{
+			name:     "grpc aborted",
+			err:      grpcStatus.Error(codes.Aborted, "operation aborted"),
+			expected: true,
+		},
+		{
+			name:     "grpc not found - not connection error",
+			err:      grpcStatus.Error(codes.NotFound, "not found"),
+			expected: false,
+		},
+		{
+			name:     "normal error",
+			err:      errors.New("some other error"),
+			expected: false,
+		},
+		{
+			name:     "permission denied - not connection error",
+			err:      errors.New("permission denied"),
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isConnectionError(tt.err)
+			assert.Equal(t, tt.expected, result, "isConnectionError(%v) = %v, want %v", tt.err, result, tt.expected)
+		})
+	}
+}
+
+func TestConnect_DeadAgentNoURL(t *testing.T) {
+	assert := assert.New(t)
+
+	k := &kataAgent{
+		ctx:  context.Background(),
+		dead: true,
+		state: KataAgentState{
+			URL: "",
+		},
+	}
+
+	err := k.connect(context.Background())
+	assert.Error(err)
+	assert.Contains(err.Error(), "dead agent with no URL to reconnect")
+	assert.True(k.dead, "agent should remain dead")
+}
+
+func TestConnect_DeadAgentNoSocket(t *testing.T) {
+	assert := assert.New(t)
+
+	k := &kataAgent{
+		ctx:               context.Background(),
+		dead:              true,
+		reconnectAttempts: 1,
+		reconnectDelay:    10 * time.Millisecond,
+		state: KataAgentState{
+			URL: "unix:///nonexistent/path/to/socket.sock",
+		},
+	}
+
+	err := k.connect(context.Background())
+	assert.Error(err)
+	assert.Contains(err.Error(), "socket not available")
+	assert.True(k.dead, "agent should remain dead")
+}
+
+func TestConnect_DeadAgentSocketNotConnectable(t *testing.T) {
+	assert := assert.New(t)
+
+	tmpFile, err := os.CreateTemp("", "fake-socket-*")
+	assert.NoError(err)
+	defer os.Remove(tmpFile.Name())
+	tmpFile.Close()
+
+	k := &kataAgent{
+		ctx:               context.Background(),
+		dead:              true,
+		reconnectAttempts: 1,
+		reconnectDelay:    10 * time.Millisecond,
+		state: KataAgentState{
+			URL: "unix://" + tmpFile.Name(),
+		},
+	}
+
+	err = k.connect(context.Background())
+	assert.Error(err)
+	assert.Contains(err.Error(), "socket not connectable")
+	assert.True(k.dead, "agent should remain dead")
+}
+
+func TestConnect_DeadAgentWithSocket(t *testing.T) {
+	assert := assert.New(t)
+
+	tmpDir, err := os.MkdirTemp("", "kata-test-*")
+	assert.NoError(err)
+	defer os.RemoveAll(tmpDir)
+
+	socketPath := filepath.Join(tmpDir, "test.sock")
+	listener, err := net.Listen("unix", socketPath)
+	assert.NoError(err)
+	defer listener.Close()
+
+	k := &kataAgent{
+		ctx:               context.Background(),
+		dead:              true,
+		reconnectAttempts: 1,
+		reconnectDelay:    10 * time.Millisecond,
+		state: KataAgentState{
+			URL: "unix://" + socketPath,
+		},
+	}
+
+	assert.True(k.dead)
+	assert.Nil(k.client)
+
+	err = k.connect(context.Background())
+
+	// Should attempt reconnection, not reject with "Dead agent"
+	assert.Error(err)
+	assert.NotContains(err.Error(), "Dead agent")
+	assert.NotContains(err.Error(), "dead agent with no URL")
+	assert.NotContains(err.Error(), "socket not available")
+	assert.NotContains(err.Error(), "socket not connectable")
+}
+
+func TestMarkDeadDuringReconnection(t *testing.T) {
+	assert := assert.New(t)
+
+	k := &kataAgent{
+		ctx:          context.Background(),
+		reconnecting: true,
+		dead:         false,
+	}
+
+	k.markDead(context.Background())
+
+	assert.False(k.dead, "markDead should defer when reconnecting")
+	assert.True(k.reconnecting, "reconnecting flag should remain set")
+}
+
+func TestMarkDeadNormal(t *testing.T) {
+	assert := assert.New(t)
+
+	k := &kataAgent{
+		ctx:          context.Background(),
+		reconnecting: false,
+		dead:         false,
+	}
+
+	k.markDead(context.Background())
+
+	assert.True(k.dead, "markDead should set dead when not reconnecting")
 }
