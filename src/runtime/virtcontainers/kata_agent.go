@@ -2272,6 +2272,10 @@ func (k *kataAgent) disconnect(ctx context.Context) error {
 	k.Lock()
 	defer k.Unlock()
 
+	return k.disconnectLocked(ctx)
+}
+
+func (k *kataAgent) disconnectLocked(ctx context.Context) error {
 	if k.client == nil {
 		return nil
 	}
@@ -2748,9 +2752,16 @@ func (k *kataAgent) addSwap(ctx context.Context, PCIPath types.PciPath) error {
 }
 
 func (k *kataAgent) markDead(ctx context.Context) {
-	k.Logger().Infof("mark agent dead")
+	k.Lock()
+	defer k.Unlock()
+
+	if k.reconnecting {
+		k.Logger().Info("reconnection in progress, deferring markDead")
+		return
+	}
+	k.Logger().Info("mark agent dead")
 	k.dead = true
-	k.disconnect(ctx)
+	k.disconnectLocked(ctx)
 }
 
 func (k *kataAgent) cleanup(ctx context.Context) {
