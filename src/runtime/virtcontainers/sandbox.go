@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	v1 "github.com/containerd/cgroups/stats/v1"
 	v2 "github.com/containerd/cgroups/v2/stats"
@@ -2566,9 +2567,12 @@ func (s *Sandbox) resourceControllerDelete() error {
 		}
 	}
 
+	s.Logger().Warnf("resourceControllerDelete: calling Delete() on sandbox cgroup %s (sandbox_cgroup_only=%v)", s.state.SandboxCgroupPath, s.config.SandboxCgroupOnly)
+	deleteStart := time.Now()
 	if err := sandboxController.Delete(); err != nil {
 		return err
 	}
+	s.Logger().Warnf("resourceControllerDelete: Delete() returned after %dms", time.Since(deleteStart).Milliseconds())
 
 	if s.state.OverheadCgroupPath != "" {
 		overheadController, err := resCtrl.LoadResourceController(s.state.OverheadCgroupPath, s.config.SandboxCgroupOnly)

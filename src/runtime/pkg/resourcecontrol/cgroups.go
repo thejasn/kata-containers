@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/containerd/cgroups"
 	cgroupsv2 "github.com/containerd/cgroups/v2"
@@ -279,11 +280,19 @@ func (c *LinuxCgroup) Delete() error {
 		return cg.Delete()
 	case *cgroupsv2.Manager:
 		if IsSystemdCgroup(c.ID()) && c.sandboxCgroupOnly {
+			controllerLogger.Warnf("LinuxCgroup.Delete: calling DeleteSystemd() for %s", c.ID())
+			deleteSystemdStart := time.Now()
 			if err := cg.DeleteSystemd(); err != nil {
+				controllerLogger.Warnf("LinuxCgroup.Delete: DeleteSystemd() failed after %dms: %v", time.Since(deleteSystemdStart).Milliseconds(), err)
 				return err
 			}
+			controllerLogger.Warnf("LinuxCgroup.Delete: DeleteSystemd() returned after %dms", time.Since(deleteSystemdStart).Milliseconds())
 		}
-		return cg.Delete()
+		controllerLogger.Warnf("LinuxCgroup.Delete: calling cg.Delete() for %s", c.ID())
+		deleteStart := time.Now()
+		err := cg.Delete()
+		controllerLogger.Warnf("LinuxCgroup.Delete: cg.Delete() returned after %dms (err=%v)", time.Since(deleteStart).Milliseconds(), err)
+		return err
 	default:
 		return ErrCgroupMode
 	}

@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	defaultCheckInterval = 5 * time.Second
+	defaultCheckInterval = 1 * time.Second
 	watcherChannelSize   = 128
 )
 
@@ -78,6 +78,7 @@ func (m *monitor) newWatcher(ctx context.Context) (chan error, error) {
 
 func (m *monitor) notify(ctx context.Context, err error) {
 	monitorLog.WithError(err).Warn("notify on errors")
+	monitorLog.Warnf("monitor.notify: VM dead detected, unblocking cgroup cleanup (sandbox=%s)", m.sandbox.id)
 	m.sandbox.agent.markDead(ctx)
 
 	m.Lock()
@@ -111,7 +112,7 @@ func (m *monitor) notify(ctx context.Context, err error) {
 func (m *monitor) stop() {
 	// wait outside of monitor lock for the watcher channel to exit.
 	defer m.wg.Wait()
-	monitorLog.Info("stopping monitor")
+	monitorLog.Warnf("monitor.stop: stopping monitor goroutine (sandbox=%s)", m.sandbox.id)
 
 	m.Lock()
 	defer m.Unlock()
